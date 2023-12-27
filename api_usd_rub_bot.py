@@ -4,9 +4,13 @@ import requests
 import sqlite3
 import pytz
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
-from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext, CallbackQueryHandler
+from telegram import Update, KeyboardButton, ReplyKeyboardMarkup
+from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext, BaseFilter, CallbackQueryHandler
 import random
+import logging
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger()
 
 load_dotenv()
 
@@ -32,15 +36,7 @@ def get_random_pet_name(chat_id):
     if special_message and special_message[0]:
         return special_message[0]
     else:
-        pet_names = [
-            "котик",
-            "зайчик",
-            "медвежонок",
-            "слоненок",
-            "леопардик",
-            "лисенок",
-            "тигренок",
-        ]
+        pet_names = ["котик", "зайчик", "медвежонок", "слоненок", "леопардик", "лисенок", "тигренок"]
         return random.choice(pet_names)
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -48,7 +44,6 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 previous_rates = {"usd": None, "eur": None}
 
 create_database()
-
 
 def get_exchange_rates():
     response = requests.get("https://www.floatrates.com/daily/usd.json")
@@ -70,6 +65,7 @@ def start(update: Update, context: CallbackContext):
     send_button(update, context)
 
 def send_exchange_rates(context: CallbackContext):
+    logger.info("Sending exchange rates...")
     global previous_rates
     usd_rate, eur_rate = get_exchange_rates()
     formatted_usd_rate = "{:.1f}".format(usd_rate)
@@ -103,7 +99,6 @@ def send_exchange_rates(context: CallbackContext):
     for chat_id_tuple in chat_ids:
         chat_id = chat_id_tuple[0]
         context.bot.send_message(chat_id=chat_id, text=f"{usd_message}\n{eur_message}")
-
 
 def get_now(update: Update, context: CallbackContext):
     chat_id = update.effective_chat.id
@@ -145,32 +140,48 @@ def button_handler(update: Update, context: CallbackContext):
         send_button(update, context)
 
 def get_first_run_time():
-    msk_tz = pytz.timezone("Europe/Moscow")
-    now = datetime.datetime.now(msk_tz)
-    next_run_time = now.replace(hour=8, minute=0, second=0, microsecond=0)
+    msk_tz = pytz.timezone('Europe/Moscow')
+    now_utc = datetime.datetime.utcnow().replace(tzinfo=pytz.utc)  # Получаем текущее время в UTC
+    next_run_time_msk = now_utc.astimezone(msk_tz).replace(hour=8, minute=0, second=0, microsecond=0)  # Следующее запускное время в МСК
 
-    if now.time() > next_run_time.time():
-        next_run_time += datetime.timedelta(days=1)
+    # Добавляем день, если время уже прошло
+    if now_utc >= next_run_time_msk.astimezone(pytz.utc):
+        next_run_time_msk += datetime.timedelta(days=1)
 
-    return next_run_time
+    next_run_time_utc = next_run_time_msk.astimezone(pytz.utc)
+    delay_seconds = (next_run_time_utc - now_utc).total_seconds()  # Вычисляем задержку в секундах
+    return delay_seconds
+
+class FilterGetCourseNow(BaseFilter):
+    def filter(self, message):
+        return 'Получить курс сейчас' in message.text
+
+filter_get_course_now = FilterGetCourseNow()
 
 def main():
     updater = Updater(TELEGRAM_TOKEN, use_context=True)
 
     dp = updater.dispatcher
 
+    # Добавляем обработчики команд
     dp.add_handler(CommandHandler("start", start))
     dp.add_handler(CommandHandler("getnow", get_now))
     dp.add_handler(CommandHandler("set_name", set_name, pass_args=True))
-    dp.add_handler(MessageHandler(Filters.text("Получить курс сейчас"), get_now))
-    dp.add_handler(MessageHandler(Filters.text, start))
+    
+    # Добавляем обработчики текстовых сообщений
+    dp.add_handler(MessageHandler(Filters.text & (~Filters.command), get_now))
+
+    # Добавляем обработчик кнопки
     dp.add_handler(CallbackQueryHandler(button_handler))
 
+    # Получаем время первого запуска задачи
+
     job_queue = updater.job_queue
-    first_run_time = get_first_run_time()
-    job_queue.run_repeating(send_exchange_rates, interval=datetime.timedelta(days=1), first=first_run_time)
+    delay_seconds = get_first_run_time()
+    logger.info(f"Scheduled to run in {delay_seconds} seconds")
+    job_queue.run_repeating(send_exchange_rates, interval=datetime.timedelta(days=1), first=delay_seconds)
 
-
+    # Запускаем бота
     updater.start_polling()
     updater.idle()
 
